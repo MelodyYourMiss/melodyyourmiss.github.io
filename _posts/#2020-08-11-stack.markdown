@@ -1,0 +1,305 @@
+---
+layout: post
+title:  栈利用之对抗linux保护
+date:   2020-08-11 00:01:01 +0300
+image:  2020-08-11-girl.jpg
+tags:   [ctf,reverse]
+---
+
+# Linux保护技术概述
+
+Checksec是一个bash脚本，用于检查可执行文件的属性（例如PIE，RELRO，PaX，Canaries，ASLR，Fortify Source）。
+
+* Canary（金丝雀）
+
+  金丝雀原来是石油工人用来判断气体是否有毒。函数开始执行的时候先往栈里插入canary值，当函数真正返回的时候会验证canary值是否合法，如果不合法就停止运行
+
+  * 在所有函数调用发生时，向栈帧内压入一个额外的随机 DWORD，这个随机数被称作“canary”，用 IDA 反汇编时，又被称作“Security Cookie”。
+  * canary 位于 EBP 之前，系统还会在.data 的内存区域中存放一个 canary 的副本。
+  * 当栈中发生溢出时，canary 将被首先淹没，之后才是 EBP 和返回地址。
+  * 在函数返回之前，系统将执行一个额外的安全验证操作，称作 Security Check。
+  * 在 Security Check 过程中，系统将比较栈帧中原先存放的 canary 和.data 中副本的值，若两者不同，则说明栈中发生了溢出，系统将进入异常处理流程，函数不会正常返回，执行___stack_chk_fail函数，就会提前退出程序。
+
+  局限性：
+
+  * 根据原理看出 canary code 不能防止函数返回地址前的缓冲区溢出。
+  * 可利用未保护内存绕过 canary 机制，由于缓冲区不是 8 字节类型且大小不大于 4 个字节可通过缓冲区不大于 4 字节的栈溢出直接绕过，此部分不经过 canary 保护。
+  * 可能根据不同机器栈地址的增长机制或不同分配影响 canary code 的保护功能。
+
+  编译选项：
+
+  -fstack-protector：启用堆栈保护，不过只为局部变量中含有 char 数组的函数插入保护代码
+  -fstack-protector-all：启用堆栈保护，为所有函数插入保护代码。
+  -fno-stack-protector：禁用堆栈保护
+
+* Fortify
+
+  只要用来防止格式化字符串。包含%n的格式化字符串不能位于程序内存中的可写地址。当使用位置参数时，必须使用范围内的所有参数，如果要使用%7$x，必须同时使用1$,2$,3$,4$,5$和6$。
+
+  编译选项：
+
+  关闭：-D_FORTIFY_SOURCE=0
+
+* NX/DEP
+
+  将数据所在内存页标识为不可执行，当程序溢出成功后转入shellcode时，程序会尝试在
+
+* PIE/ASLR
+
+  使得程序地址空间分布随机化，增加ROP等利用的难度
+
+  编译选项
+
+  关闭：-no-pie
+
+  开启：-pie-fPIC
+
+* RELRO
+
+  设置符号重定向表为只读并在程序启动时就解析并绑定所有动态符号，从而减少对GOT（Global Offset Table）表攻击。
+
+  编译选项
+
+  开启（部分）：-z lazy
+
+  开启（完全）：-z now
+
+### 对抗NX/DEP保护技术
+
+用于保护函数调用信息和局部变量
+
+x86：函数参数保存在栈上，在函数返回地址的而上方
+
+x64：前六个整性或指针参数依次保存在RDI，RSI，RDX，RCX，R8和R9寄存器中，如果还有更多的参数的话才会存在栈上
+
+栈溢出的基本前提
+
+* 程序必须向栈上写入数据
+* 写入的数据大小没有被良好地控制
+
+#### ret2text
+
+控制程序执行程序本身已有的代码
+
+rbp
+
+rip
+
+#### ret2shellcode
+
+控制程序执行shellcode代码
+
+```python
+shellcode = asm(shellcraft.sh())
+```
+
+然而有了NX保护之后，堆、栈、bss段就没有执行权限了.
+
+------------------------------
+
+### DynELF原理
+
+#### 获取vul_elf内存加载基地址
+
+已知vul_elf加载内存范围内的一个地址ptr，将该地址进行页对齐
+
+```assembly
+page_size = 0x1000
+page_mask = ~(page_size - 1)
+ptr &= page_mask
+```
+
+然后对比内存页起始字符串是否为'\x7fELF'，如果不是，一直向低地址内存页(ptr -= page_size)进行查找，找到符合该条件的页面，该页面起始地址就是vul_elf文件内存加载基地址。
+
+#### 获取libc.so内存加载基地址
+
+vul_elf是动态链接的可执行文件，在该类型文件中有一个link_map双向链表，其中包含了每个动态加载的库的路径和加载基址等信息，其数据结构为：
+
+可以通过两种途径获取link_map链表：一是在所有ELF文件中，通过Dynamic段DT_DEBUG区域得到。二是在non-RELRO ELF文件中，link_map地址存在于.got.plt区节中，该区节的加载地址可以从DYNAMIC段DT_PLTGOT区域得到。
+
+这两种途径都需要知道vul_elf的DYNAMIC段地址：我们在第一步中获取了vul_el内存加载基地址，由此可以得到vul_elf段表，通过解析vul_elf段表可以得到DYNAMIC基地址。
+
+#### 获取libc.so的hash表、动态符号表、字符串表基地址
+
+在所有需要导出函数给其他文件使用的ELF文件（例如: “libc.so”）中，用动态符号表、字符串表、hash表等一系列表用于指示导出符号（例如:”system”）的名称、地址、hash值等信息。通过libc.so的Dynamic段DT_GNU_HASH、DT_SYMTAB、DT_STRTAB可以获取hash表、动态符号表、字符串表在内存中的基地址。
+
+#### 通过hash表获取system函数地址
+
+hash表是用于查找符号的散列表，通过libc.so的hash表可以找到system函数内存加载地址，在ELF文件中有SYSV、GNU两种类型的hash表，其中通过GNU HASH查找system函数地址示意图如下。其寻找过程涉及诸多细节，在此不多叙述，后面会写文章对通过hash表找到符号地址作专门讲解。
+
+```assembly
+hash=gnu_hash(“system”)，gnu_hash是GNU HASH算法函数
+ndx=hash%nbuckets，ndx是符号表中所有 符号HASH%nubuckets 相等的起始索引
+```
+
+最后：内存泄露函数在过程中用作读取程序内存数据，像上面例子中获取link_map、DYNAMIC段、vul_elf段表等内容都是通过内存泄露函数。
+
+---------------------------------
+
+### 对抗ASLR/PIE保护技术
+
+如果需要跳转的目标函数在程序中没有，如：system函数，Libc中应有尽有。
+
+然而ASLR/PIE保护技术使得程序基地址和libc基地址每次加载的都不一样。
+
+#### 延迟绑定机制
+
+动态链接比静态链接更加灵活，但是牺牲了性能。
+
+* 动态链接下对于全局和静态数据的访问都要进行复杂的**GOT（全局偏移表）定位**，然后间接寻址；对于模块间的调用也要先定位GOT，然后再进行跳转
+
+* 动态链接的**链接工作是在运行时完成**，即程序开始运行时，动态链接器都要进行一次链接工作，而链接工作需要复杂的重定位等工作，减慢了启动速度
+
+据统计，动态链接比静态链接要慢1%~5%。
+
+因此，针对第二点，提出了延迟绑定技术：函数第一次被调用时才进行绑定。通过延迟绑定，大大的加快了程序的启动速度，而ELF文件则使用了PLT的技术来实现延迟绑定。
+
+延迟绑定实现步骤：
+
+* 建立一个GOT.PLT表存放全局函数的实际地址。
+
+* 对每一个全局函数，链接器都会生成一个与之相对应的plt，例如fun@plt。
+
+```assembly
+fun@plt:
+jmp *(fun@got.plt)
+push index
+jmp _init
+```
+
+其中的第一条指令，就是直接从got.plt中获取到真实的函数地址（仅第一次调用，若不是第一次就已经是真实地址），第二条指令就是把这个函数在got.plt表中的编号作为参数，传递给_init()，而\_init()将其重定位，然后将结果写入到got.plt中。
+
+只能泄露已经执行过一次函数的libc地址，因为动态链接库的加载机制……
+
+利用思路
+
+* 泄露GOT表中某个函数的libc地址
+* 在libc中找到system，'/bin/sh'和这个函数的相对偏移
+* 得到system的地址和'/bin/sh'的地址
+* 构造ROP链，成功利用
+
+在执行了一次某函数之后，GOT表中就会把一个函数在程序中的终极偏移存起来。
+$$
+终极偏移 = libc基址（每次加载都不一样）+库内函数相对偏移
+$$
+System = libc基址 + system在库中的相对偏移
+'/bin/sh' = libc基址 + '/bin/sh'在库中的相对偏移
+
+如果开启了PIE，使得程序基地址每次加载也不同，也就是连最基本的gadgets的地址都不知道，只能结合其他漏洞或者功能先进行泄露。
+
+### 对抗Canary保护技术
+
+* 泄露Canary值
+
+  与泄露及地址的方法类似
+
+* 泄露fs：28h内的值
+
+* 复写副本值
+
+  需要进行位置的爆破
+
+* 劫持stack_chk_fail
+
+  可以修改全局偏移表（GOT）中储存的函数
+
+* stack smashing
+
+  当canary被覆盖之后，会call到__stack_chk_fail打印ardv[0]这个指针指向的字符串，默认是程序的名字。
+
+* 逐字节爆破（BROP）
+
+  攻击条件：
+
+  * 远程程序必须先存在一个已知的stack overflow的漏洞，而且攻击者知道如何触发这个漏洞
+
+  * 服务器进程在crash之后会重新复活，并且复活的进程不会被re-rand（）。这个需求其实是合理的，因为当前像nginx，MySQL，Apache，OpenSSH等服务器应用都符合这种。
+
+  核心就是想办法泄露程序的更多信息。通过某种方法从远程服务器dump出该程序的内存到本地。
+
+  基本思路：
+
+  * 判断栈溢出的长度
+  * 逐字节爆破Canary（如果没有开，就跳过这一步）
+  * 寻找stop gadget
+  * 寻找userful gadget（尤其是Brop gadget）
+  * 寻找可用的PLT表项
+  * 利用PLT表中的puts（或者write）函数，配合useful gadget，来远程dump信息
+
+* windows可以算出来
+  $$
+  canary= \_\_security\_cookie\land ebp
+  $$
+
+### 溢出长度不够——栈劫持
+
+如果可以在.bss段等已知位置进行写入，就可以提前进行栈布局。通过覆盖栈上的存储的saved rbp和saved rip，将栈进行劫持。
+
+leave
+
+```assembly
+mov rsp,rbp(把rsp弄回来)
+pop rbp(把rbp弄回来)
+```
+
+ret
+
+```assembly
+pop rip(这个时候rip就被retaddr的值取代了)
+```
+
+### SROP
+
+全称是Sigreturn Oriented Programming。在这里‘sigreturn’是一个系统调用……
+
+内核会为该进程保存相应的上下文，主要是将所有寄存器压入栈中，以及压入signal信息……
+
+内核主要做的工作走就是为进程保存上下文……
+
+#### 利用思路
+
+如果希望执行一系列的函数，只需要做两处修改即可：
+
+* 控制栈指针
+* 把原来rip指向的syscall gadget换成syscall;ret gadget
+
+在构造ROP攻击的时候需要满足下面的条件
+
+* 可以通过栈溢出来控制栈的内容
+* 需要知道相应的地址
+  * /bin/sh
+  * Signal Frame
+  * syscall
+  * sigreturn
+* 需要有够大的空间来塞下整个sigal frame
+
+### Linux内核
+
+利用ROP，直接执行commit_creds(prepare_kernel_cred(0))……
+
+# 格式化字符串漏洞利用技术
+
+### dl_runtime_resolve高级利用技术
+
+正常情况下，PWN类型的漏洞题目一般会提供一个可执行程序，同时会提供程序运行动态链接的libc库。通过libc.so可以得到库函数的偏移地址，再结合泄露GOT表中libc函数的地址，计算出进程中实际函数的地址，以绕过ASLR。也就是常用的ret2libc技术，如果题目只给了可执行程序，ret2_dl_runtime_resolve技术可以使我们不依赖libc的攻击手法。
+
+ELF可执行文件由ELF头部，程序头部表和其对应的段，节区头部表和其对应的节组成。如果一个可执行文件参与动态链接，他的程序头部表将包含类型为PT_DYNAMIC的段，它包含.dynamic节区，
+
+其中Tag对应着每个节区。比如JMPREL对应着.rel.plt。节区中包含目标文件的所有信息。
+
+类型为REL的节区包含重定位表项。
+
+* .rel.plt节是用于函数重定位，.rel.dyn节是用于变量重定位。
+* .dynsym节区包含了动态链接符号表。
+* .dynstr节包含了动态链接的字符串。这个节区以\x00作为开始和结尾，中间每个字符也已\x00间隔。
+* .plt节是过程链接表。过程链接表把独立的函数调用重定向到绝对位置。
+
+漏洞利用流程
+
+* 控制EIP为PLT[0]的地址，只需传递一个index_arg参数
+* 控制index_arg的大小，使reloc的位置落在可控地址内
+* 伪造reloc的内容，使sym落在可控地址内
+* 伪造sym的内容，使name落在可控地址内
+* 伪造name为任意库函数，如system
+
+利用roputils上述伪造过程傻瓜式解决
