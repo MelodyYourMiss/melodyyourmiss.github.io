@@ -269,7 +269,7 @@ goto :goto_0
 
 妈的这里的反编译需要用到apktools.jar，而2.x版本的需要jdk1.7，搞java环境搞了一晚上，终于得到getflag()的结果。
 
-ek\`fz@q2^x/t^fn0mF^6/^rb\`qanqntfg^E`hq|
+ek\`fz@q2^x/t^fn0mF^6/^rb\`qanqntfg^E`hq\|
 
 然后每个字符减1
 
