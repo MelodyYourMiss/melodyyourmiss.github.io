@@ -98,7 +98,7 @@ def getGopcln(self):
 
 还是利用print查看变量的值
 
-```
+```assembly
 ('gopcln_tab=', None)
 ```
 
