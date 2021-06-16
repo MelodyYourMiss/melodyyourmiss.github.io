@@ -5,3 +5,6 @@ permalink: /friendLink/
 image: ship.jpg
 ---
 
+🐻Bro
+
+http://maxzed.top/
