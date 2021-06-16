@@ -7,4 +7,4 @@ image: ship.jpg
 
 🐻Bro
 
-http://maxzed.top/
+<http://maxzed.top/>
