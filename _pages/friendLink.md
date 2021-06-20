@@ -1,7 +1,7 @@
 ---
 layout: page
 title: FriendLink
-permalink: /friendLink/
+permalink: /friendLink
 image: ship.jpg
 ---
 
